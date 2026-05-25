@@ -8,6 +8,8 @@ if (-not (Test-Path $configPath)) {
     exit 1
 }
 . $configPath
+# Write-Host "DEBUG - Key prefix: $($config.ApiKey.Substring(0,15))..." -ForegroundColor Magenta
+# Write-Host "DEBUG - Model: $($config.Model)" -ForegroundColor Magenta
 
 # Create log folder if needed
 if (-not (Test-Path $config.LogFolder)) {
@@ -28,21 +30,26 @@ function Invoke-ClaudeAnalysis {
         )
     } | ConvertTo-Json -Depth 5
 
+    # Build headers explicitly as a variable
+    $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
+    $headers.Add("x-api-key", $config.ApiKey)
+    $headers.Add("anthropic-version", $config.ApiVersion)
+    $headers.Add("content-type", "application/json")
+
+    # Write-Host "DEBUG - Header key value: $($headers['x-api-key'].Substring(0,15))..." -ForegroundColor Magenta
+
     try {
         $response = Invoke-RestMethod `
-            -Uri "https://api.anthropic.com/v1/messages" `
+            -Uri $config.Uri `
             -Method POST `
-            -Headers @{
-                "x-api-key"         = $config.ApiKey
-                "anthropic-version" = $config.ApiVersion
-                "content-type"      = "application/json"
-            } `
+            -Headers $headers `
             -Body $body
 
         return $response.content[0].text
     }
     catch {
-        return "API error: $($_.Exception.Message)"
+        $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+        return "API error: $($reader.ReadToEnd())"
     }
 }
 
@@ -69,6 +76,8 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  Netstat-Claude Network Monitor" -ForegroundColor Cyan
 Write-Host "  Logging to: $logFile" -ForegroundColor Cyan
 Write-Host "  Interval: $($config.IntervalSeconds)s" -ForegroundColor Cyan
+Write-Host "  API Uri: $($config.Uri)" -ForegroundColor Cyan
+Write-Host "  Model: $($config.Model)" -ForegroundColor Cyan
 Write-Host "  Press Ctrl+C to stop" -ForegroundColor Cyan
 Write-Host "========================================`n" -ForegroundColor Cyan
 
