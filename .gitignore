@@ -1,0 +1,8 @@
+# Secret and machine-specific config - never commit
+netstat-claude.properties
+netstat-claude.config.ps1~*
+# Log files
+log/
+
+# PowerShell temp files
+*.tmp
