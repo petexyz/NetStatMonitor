@@ -14,12 +14,12 @@ if (-not (Test-Path $configPath)) {
 }
 . $configPath
 
-# Create log folder and files IMMEDIATELY - must happen before any Write-Log calls
+# Create log folder and files IMMEDIATELY - before any Write-Log calls
 if (-not (Test-Path $config.LogFolder)) {
     New-Item -ItemType Directory -Path $config.LogFolder -Force | Out-Null
 }
-$logFile        = Join-Path $config.LogFolder "netstat-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
-$masterCsvFile  = Join-Path $config.LogFolder "master-connections-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
+$logFile       = Join-Path $config.LogFolder "netstat-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
+$masterCsvFile = Join-Path $config.LogFolder "master-connections-$(Get-Date -Format 'yyyyMMdd-HHmmss').csv"
 New-Item -ItemType File -Path $logFile -Force | Out-Null
 
 # Get local machine IP
@@ -31,7 +31,7 @@ $localIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
 # Initialise known local IPs as a growable list seeded from config
 $script:knownLocalIPs = [System.Collections.ArrayList]$config.KnownLocalIPs
 
-# Dynamically detect VPN and virtual network interface IPs at startup
+# Dynamically detect VPN and virtual network interface IPs
 function Get-VirtualInterfaceIPs {
     $virtualIPs      = @()
     $vpnAdapterNames = @(
@@ -71,25 +71,21 @@ function Get-VirtualInterfaceIPs {
     return $virtualIPs
 }
 
-# Global known IPs table populated at startup and refreshed hourly
-$knownIPs    = @{}
-$lastResolve = [DateTime]::MinValue
+# Global state
+$knownIPs          = @{}
+$lastResolve       = [DateTime]::MinValue
+$lastBatchTime     = Get-Date
+$lastSnapshotTime  = [DateTime]::MinValue
+$lastKeepalive     = [DateTime]::MinValue
+$elevatedBatchMode = $false
+$elevatedBatchMins = 30
 
-# Master connection log - keyed on LocalAddress|RemoteAddress|State|Process
+# Master connection log - ESTABLISHED connections only, no torrent
 $masterConnections = @{}
 $masterAddCount    = 0
 $masterUpdateCount = 0
 
-# Batch storage for Claude sends
-$lastBatchTime    = Get-Date
-$lastSnapshotTime = [DateTime]::MinValue
-$lastKeepalive    = [DateTime]::MinValue
-
-# Elevated mode affects batch interval only - NOT snapshot interval
-$elevatedBatchMode    = $false
-$elevatedBatchMinutes = 30
-
-# ── Logging helper ────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 
 function Write-Log {
     param([string]$message, [string]$color = "White")
@@ -127,22 +123,13 @@ function Test-IsKnownSubnet {
     return $false
 }
 
-function Test-IsTorrentLine {
-    param([string]$line)
-    if ($line -match "qbittorrent" -and $line -match "TIME_WAIT|SYN_SENT") { return $true }
-    if ($line -match "TIME_WAIT|SYN_SENT" -and
-        $line -notmatch "\["              -and
-        $line -notmatch "127\.0\.0\.1") { return $true }
-    return $false
-}
-
 function Find-NewLocalDevices {
     param([string]$snapshot)
     $newDevices  = @()
     $localRanges = @("192\.168\.", "10\.", "172\.(1[6-9]|2[0-9]|3[01])\.")
 
     foreach ($line in ($snapshot -split "`n")) {
-        if ($line -match "ESTABLISHED|TIME_WAIT") {
+        if ($line -match "ESTABLISHED") {
             foreach ($range in $localRanges) {
                 if ($line -match "($range\d+\.\d+)") {
                     $ip = $matches[1]
@@ -163,7 +150,7 @@ function Resolve-UnknownProcesses {
     param([string]$pidOutput)
     $results = @()
     foreach ($line in ($pidOutput -split "`n")) {
-        if ($line -match "ESTABLISHED|LISTENING|TIME_WAIT|CLOSE_WAIT|FIN_WAIT") {
+        if ($line -match "ESTABLISHED") {
             $parts = ($line -split "\s+") | Where-Object { $_ }
             if ($parts.Count -ge 5) {
                 $procID = $parts[-1]
@@ -191,7 +178,9 @@ function Get-NetstatSnapshot {
         return $null
     }
 
+    # Only enrich ESTABLISHED connections - skip TIME_WAIT entirely
     $enriched = Resolve-UnknownProcesses -pidOutput ($withPIDs -join "`n")
+
     return @{
         WithNames = $joined
         Enriched  = $enriched
@@ -200,53 +189,48 @@ function Get-NetstatSnapshot {
 }
 
 # ── Master Connection Log ─────────────────────────────────────────────────────
+# ESTABLISHED connections only - TIME_WAIT and torrent excluded entirely
 
 function Update-MasterLog {
     param([hashtable]$snapshot)
 
-    $timestamp  = $snapshot.Timestamp
-    $addCount   = 0
-    $updCount   = 0
-    $isTorrent  = $false
+    $timestamp = $snapshot.Timestamp
+    $addCount  = 0
+    $updCount  = 0
 
-    # Parse enriched output which has process names appended
     foreach ($line in ($snapshot.Enriched -split "`n")) {
 
-        # Match TCP connection lines with process name
-        if ($line -match "^\s*TCP\s+(\S+)\s+(\S+)\s+(\w+)") {
+        # ESTABLISHED only - skip TIME_WAIT, SYN_SENT, CLOSE_WAIT etc
+        if ($line -notmatch "ESTABLISHED") { continue }
+
+        # Skip localhost internal connections
+        if ($line -match "127\.0\.0\.1.*127\.0\.0\.1") { continue }
+
+        if ($line -match "^\s*TCP\s+(\S+)\s+(\S+)\s+ESTABLISHED") {
             $local  = $matches[1]
             $remote = $matches[2]
-            $state  = $matches[3]
             $proc   = "unknown"
 
-            # Extract process name from [ProcessName] at end of line
             if ($line -match "\[(.+?)\]") { $proc = $matches[1] }
 
-            # Skip localhost internal connections
-            if ($local -match "^127\." -and $remote -match "^127\.") { continue }
+            # Skip torrent process entirely - not stored at all
+            if ($proc -imatch "qbittorrent|bittorrent|utorrent|transmission|deluge") { continue }
 
-            # Identify torrent lines - keep in master but flag
-            $isTorrent = Test-IsTorrentLine -line $line
-
-            $key = "$local|$remote|$state|$proc"
+            $key = "$local|$remote|$proc"
 
             if ($masterConnections.ContainsKey($key)) {
-                # Update existing entry
                 $masterConnections[$key].LastSeen = $timestamp
                 $masterConnections[$key].Count++
                 $script:masterUpdateCount++
                 $updCount++
             } else {
-                # New entry
                 $masterConnections[$key] = [PSCustomObject]@{
-                    FirstSeen  = $timestamp
-                    LastSeen   = $timestamp
-                    Count      = 1
-                    State      = $state
-                    Local      = $local
-                    Remote     = $remote
-                    Process    = $proc
-                    IsTorrent  = $isTorrent
+                    FirstSeen = $timestamp
+                    LastSeen  = $timestamp
+                    Count     = 1
+                    Local     = $local
+                    Remote    = $remote
+                    Process   = $proc
                 }
                 $script:masterAddCount++
                 $addCount++
@@ -254,25 +238,18 @@ function Update-MasterLog {
         }
     }
 
-    # Log running counts on every snapshot
-    $total   = $masterConnections.Count
-    $torrent = ($masterConnections.Values | Where-Object { $_.IsTorrent }).Count
-    $clean   = $total - $torrent
+    $total = $masterConnections.Count
+    Write-Log "$timestamp - Master log: +$addCount new, ~$updCount updated | Total: $total ESTABLISHED | Session: $($script:masterAddCount) added, $($script:masterUpdateCount) updated" "DarkGray"
 
-    Write-Log "$timestamp - Master log: +$addCount new, ~$updCount updated | Total: $total ($clean non-torrent, $torrent torrent) | Session totals: $($script:masterAddCount) added, $($script:masterUpdateCount) updated" "DarkGray"
-
-    # Write CSV whenever new entries were added
-    if ($addCount -gt 0) {
-        Write-MasterCsv
-    }
+    if ($addCount -gt 0) { Write-MasterCsv }
 }
 
 function Write-MasterCsv {
-    $header = "FirstSeen,LastSeen,Count,State,LocalAddress,RemoteAddress,Process,IsTorrent"
+    $header = "FirstSeen,LastSeen,Count,LocalAddress,RemoteAddress,Process"
     $rows   = $masterConnections.Values |
         Sort-Object FirstSeen |
         ForEach-Object {
-            "$($_.FirstSeen),$($_.LastSeen),$($_.Count),$($_.State),$($_.Local),$($_.Remote),$($_.Process),$($_.IsTorrent)"
+            "$($_.FirstSeen),$($_.LastSeen),$($_.Count),$($_.Local),$($_.Remote),$($_.Process)"
         }
 
     @($header) + $rows | Set-Content -Path $masterCsvFile -Encoding UTF8
@@ -280,59 +257,76 @@ function Write-MasterCsv {
 }
 
 function Format-MasterForClaude {
-    # Send master log to Claude - exclude torrent rows, include summary of them
-    $nonTorrent   = $masterConnections.Values | Where-Object { -not $_.IsTorrent } | Sort-Object FirstSeen
-    $torrentRows  = $masterConnections.Values | Where-Object { $_.IsTorrent }
-    $torrentCount = $torrentRows.Count
-    $torrentIPs   = ($torrentRows | ForEach-Object { $_.Remote -replace ":\d+$","" } | Sort-Object -Unique).Count
+    $rows = $masterConnections.Values | Sort-Object FirstSeen
 
     $sb = [System.Text.StringBuilder]::new()
-    [void]$sb.AppendLine("=== MASTER CONNECTION LOG ===")
-    [void]$sb.AppendLine("Session start    : $($masterConnections.Values | Sort-Object FirstSeen | Select-Object -First 1 | ForEach-Object { $_.FirstSeen })")
-    [void]$sb.AppendLine("Current time     : $(Get-Date -Format 'HH:mm:ss')")
-    [void]$sb.AppendLine("Total unique     : $($masterConnections.Count)")
-    [void]$sb.AppendLine("Non-torrent rows : $($nonTorrent.Count)")
-    [void]$sb.AppendLine("Torrent rows     : $torrentCount across ~$torrentIPs peer IPs (OMITTED - normal activity)")
-    [void]$sb.AppendLine("Session adds     : $($script:masterAddCount)")
-    [void]$sb.AppendLine("Session updates  : $($script:masterUpdateCount)")
+    [void]$sb.AppendLine("=== MASTER CONNECTION LOG - ESTABLISHED ONLY ===")
+    [void]$sb.AppendLine("Session start  : $($masterConnections.Values | Sort-Object FirstSeen | Select-Object -First 1 | ForEach-Object { $_.FirstSeen })")
+    [void]$sb.AppendLine("Current time   : $(Get-Date -Format 'HH:mm:ss')")
+    [void]$sb.AppendLine("Total unique   : $($masterConnections.Count)")
+    [void]$sb.AppendLine("Session adds   : $($script:masterAddCount)")
+    [void]$sb.AppendLine("Session updates: $($script:masterUpdateCount)")
+    [void]$sb.AppendLine("Note: TIME_WAIT, torrent, and localhost connections excluded entirely")
     [void]$sb.AppendLine("")
-    [void]$sb.AppendLine("FirstSeen,LastSeen,Count,State,LocalAddress,RemoteAddress,Process")
+    [void]$sb.AppendLine("FirstSeen,LastSeen,Count,LocalAddress,RemoteAddress,Process")
 
-    foreach ($row in $nonTorrent) {
-        [void]$sb.AppendLine("$($row.FirstSeen),$($row.LastSeen),$($row.Count),$($row.State),$($row.Local),$($row.Remote),$($row.Process)")
+    foreach ($row in $rows) {
+        [void]$sb.AppendLine("$($row.FirstSeen),$($row.LastSeen),$($row.Count),$($row.Local),$($row.Remote),$($row.Process)")
     }
 
     return $sb.ToString()
 }
 
+# ── API Functions ─────────────────────────────────────────────────────────────
+
 function Build-CachedHeaders {
     $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
-    $headers.Add("x-api-key",        $config.ApiKey)
-    $headers.Add("anthropic-version", $config.ApiVersion)
-    $headers.Add("content-type",      "application/json")
-    $headers.Add("anthropic-beta",    "prompt-caching-2024-07-31")
+    $headers.Add("x-api-key",         $config.ApiKey)
+    $headers.Add("anthropic-version",  $config.ApiVersion)
+    $headers.Add("content-type",       "application/json")
+    $headers.Add("anthropic-beta",     "prompt-caching-2024-07-31")
     return $headers
+}
+
+function Build-CachedBody {
+    param([string]$dynamicText, [int]$maxTokens)
+
+    # Use [ordered] and Depth 10 to ensure cache_control serialises correctly
+    $body = [ordered]@{
+        model      = $config.Model
+        max_tokens = $maxTokens
+        messages   = @(
+            [ordered]@{
+                role    = "user"
+                content = @(
+                    [ordered]@{
+                        type          = "text"
+                        text          = $config.PromptStatic
+                        cache_control = [ordered]@{ type = "ephemeral"; ttl = "1h" }
+                    },
+                    [ordered]@{
+                        type = "text"
+                        text = $dynamicText
+                    }
+                )
+            }
+        )
+    }
+    return $body | ConvertTo-Json -Depth 10
 }
 
 function Invoke-CacheKeepalive {
     Write-Log "$(Get-Date -Format 'HH:mm:ss') - Sending cache keepalive..." "DarkGray"
-    $body = @{
-        model      = $config.Model
-        max_tokens = 1
-        messages   = @(@{
-            role    = "user"
-            content = @(
-                @{ type = "text"; text = $config.PromptStatic; cache_control = @{ type = "ephemeral"; ttl = "1h" } },
-                @{ type = "text"; text = "Keepalive" }
-            )
-        })
-    } | ConvertTo-Json -Depth 7
+
+    $body = Build-CachedBody -dynamicText "Keepalive" -maxTokens 1
 
     try {
         Invoke-RestMethod -Uri $config.Uri -Method POST -Headers (Build-CachedHeaders) -Body $body | Out-Null
         Write-Log "$(Get-Date -Format 'HH:mm:ss') - Cache keepalive OK" "DarkGray"
     }
-    catch { Write-Log "$(Get-Date -Format 'HH:mm:ss') - Cache keepalive failed: $($_.Exception.Message)" "Yellow" }
+    catch {
+        Write-Log "$(Get-Date -Format 'HH:mm:ss') - Cache keepalive failed: $($_.Exception.Message)" "Yellow"
+    }
 }
 
 function Invoke-ClaudeAnalysis {
@@ -353,17 +347,7 @@ function Invoke-ClaudeAnalysis {
         $config.ImmediatePromptDynamic -f $netstatOutput, $knownIPContext, $newDeviceContext
     }
 
-    $body = @{
-        model      = $config.Model
-        max_tokens = $config.MaxTokens
-        messages   = @(@{
-            role    = "user"
-            content = @(
-                @{ type = "text"; text = $config.PromptStatic; cache_control = @{ type = "ephemeral"; ttl = "1h" } },
-                @{ type = "text"; text = $dynamicText }
-            )
-        })
-    } | ConvertTo-Json -Depth 7
+    $body = Build-CachedBody -dynamicText $dynamicText -maxTokens $config.MaxTokens
 
     try {
         $response = Invoke-RestMethod -Uri $config.Uri -Method POST -Headers (Build-CachedHeaders) -Body $body
@@ -373,6 +357,11 @@ function Invoke-ClaudeAnalysis {
             $cacheRead    = if ($usage.cache_read_input_tokens)     { $usage.cache_read_input_tokens }     else { 0 }
             $cacheCreated = if ($usage.cache_creation_input_tokens) { $usage.cache_creation_input_tokens } else { 0 }
             Write-Log "  Cache: wrote=$cacheCreated read=$cacheRead input=$($usage.input_tokens) output=$($usage.output_tokens)" "DarkGray"
+
+            # Warn if cache still not hitting after first call
+            if ($cacheRead -eq 0 -and $cacheCreated -eq 0) {
+                Write-Log "  WARNING: Cache not activating - check anthropic-beta header and prompt size" "Yellow"
+            }
         }
         return $response.content[0].text
     }
@@ -424,7 +413,7 @@ $analysis
 }
 
 function Get-CurrentBatchInterval {
-    if ($elevatedBatchMode) { return $elevatedBatchMinutes }
+    if ($elevatedBatchMode) { return $elevatedBatchMins }
     return $config.BatchIntervalMinutes
 }
 
@@ -432,20 +421,17 @@ function Get-CurrentBatchInterval {
 
 Write-Log "========================================" "Cyan"
 Write-Log "  Netstat-Claude Network Monitor" "Cyan"
-Write-Log "  Machine IP        : $localIP" "Cyan"
-Write-Log "  Session log       : $logFile" "Cyan"
-Write-Log "  Master CSV        : $masterCsvFile" "Cyan"
-Write-Log "  Snapshot every    : $($config.SnapshotIntervalSeconds)s" "Cyan"
-Write-Log "  Batch analysis    : every $($config.BatchIntervalMinutes) min" "Cyan"
-Write-Log "  Elevated batch    : every ${elevatedBatchMinutes} min on HIGH/CRITICAL" "Cyan"
-Write-Log "  Cache keepalive   : every $($config.KeepaliveIntervalMinutes) min" "Cyan"
-Write-Log "  API Uri           : $($config.Uri)" "Cyan"
-Write-Log "  Model             : $($config.Model)" "Cyan"
-Write-Log "  NOTE: Master log deduplicates all connections with first/last seen + count" "Cyan"
-Write-Log "  NOTE: Claude receives master log - not raw snapshots" "Cyan"
-Write-Log "  NOTE: Torrent rows kept in CSV but excluded from Claude payload" "Cyan"
-Write-Log "  NOTE: Elevated mode = shorter batch interval only, snapshot unchanged" "Cyan"
-Write-Log "  NOTE: New device alerts do NOT trigger elevated mode" "Cyan"
+Write-Log "  Machine IP      : $localIP" "Cyan"
+Write-Log "  Session log     : $logFile" "Cyan"
+Write-Log "  Master CSV      : $masterCsvFile" "Cyan"
+Write-Log "  Snapshot every  : $($config.SnapshotIntervalSeconds)s (1 min)" "Cyan"
+Write-Log "  Batch analysis  : every $($config.BatchIntervalMinutes) min (1 hr)" "Cyan"
+Write-Log "  Elevated batch  : every ${elevatedBatchMins} min on HIGH/CRITICAL" "Cyan"
+Write-Log "  Cache keepalive : every $($config.KeepaliveIntervalMinutes) min" "Cyan"
+Write-Log "  API Uri         : $($config.Uri)" "Cyan"
+Write-Log "  Model           : $($config.Model)" "Cyan"
+Write-Log "  Est. cost 24/7  : ~$0.19/day (~$5.80/month)" "Cyan"
+Write-Log "  ESTABLISHED connections only - TIME_WAIT and torrent excluded" "Cyan"
 Write-Log "========================================" "Cyan"
 Write-Log "" "White"
 
@@ -462,11 +448,11 @@ foreach ($ip in $script:knownLocalIPs) {
 }
 Write-Log "" "White"
 
-Write-Log "Detecting VPN/virtual network interfaces..." "Cyan"
-$detectedVirtualIPs = Get-VirtualInterfaceIPs
-if ($detectedVirtualIPs.Count -gt 0) {
-    foreach ($vip in $detectedVirtualIPs) {
-        Write-Log "  Detected virtual/VPN interface: $vip" "DarkGray"
+Write-Log "Detecting VPN/virtual interfaces..." "Cyan"
+$detectedVIPs = Get-VirtualInterfaceIPs
+if ($detectedVIPs.Count -gt 0) {
+    foreach ($vip in $detectedVIPs) {
+        Write-Log "  Detected: $vip" "DarkGray"
     }
 } else {
     Write-Log "  No VPN/virtual interfaces detected" "DarkGray"
@@ -483,8 +469,8 @@ Invoke-CacheKeepalive
 $lastKeepalive = Get-Date
 Write-Log "" "White"
 
-# Write CSV header immediately
-"FirstSeen,LastSeen,Count,State,LocalAddress,RemoteAddress,Process,IsTorrent" |
+# Initialise master CSV header
+"FirstSeen,LastSeen,Count,LocalAddress,RemoteAddress,Process" |
     Set-Content -Path $masterCsvFile -Encoding UTF8
 Write-Log "Master CSV initialised: $masterCsvFile" "DarkGray"
 Write-Log "" "White"
@@ -495,7 +481,7 @@ while ($true) {
     $now       = Get-Date
     $timestamp = $now.ToString('HH:mm:ss')
 
-    # Hourly: refresh host resolutions and re-detect VPN interfaces
+    # Hourly: refresh host resolutions and re-detect VPN
     if (((Get-Date) - $lastResolve).TotalSeconds -gt $config.ResolveInterval) {
         Write-Log "$timestamp - Refreshing host resolutions..." "Cyan"
         $knownIPs    = Resolve-KnownHosts
@@ -518,7 +504,7 @@ while ($true) {
         $snapshot = Get-NetstatSnapshot
         if ($null -eq $snapshot) { Start-Sleep -Seconds 30; continue }
 
-        # Update master connection log - deduplicates, logs adds/updates, writes CSV
+        # Update master log - ESTABLISHED only, torrent excluded
         Update-MasterLog -snapshot $snapshot
 
         # Check for new local devices - immediate analysis, no interval change
@@ -558,8 +544,7 @@ while ($true) {
         $reason = "scheduled ($currentBatchInterval min interval)"
         Write-Log "" "White"
         Write-Log "=== $timestamp - Sending master log to Claude: $reason ===" "Yellow"
-        Write-Log "  Non-torrent rows: $(($masterConnections.Values | Where-Object { -not $_.IsTorrent }).Count)" "DarkGray"
-        Write-Log "  Torrent rows (excluded from payload): $(($masterConnections.Values | Where-Object { $_.IsTorrent }).Count)" "DarkGray"
+        Write-Log "  ESTABLISHED connections: $($masterConnections.Count)" "DarkGray"
 
         $masterPayload = Format-MasterForClaude
 
@@ -576,7 +561,7 @@ while ($true) {
 
         Write-LogEntry `
             -timestamp $timestamp `
-            -mode "BATCH-MASTER-LOG ($($masterConnections.Count) unique connections | $reason)" `
+            -mode "BATCH-MASTER-LOG ($($masterConnections.Count) connections | $reason)" `
             -payload $masterPayload `
             -analysis $analysis `
             -newDevices @()
@@ -585,7 +570,7 @@ while ($true) {
         if ($analysis -imatch "HIGH|CRITICAL") {
             if (-not $elevatedBatchMode) {
                 $elevatedBatchMode = $true
-                Write-Log "$timestamp - ELEVATED BATCH MODE - batches every ${elevatedBatchMinutes} min" "Red"
+                Write-Log "$timestamp - ELEVATED BATCH MODE - batches every ${elevatedBatchMins} min" "Red"
             }
         } elseif ($elevatedBatchMode -and $analysis -imatch "LOW|no.*suspicious|nothing.*unusual") {
             $elevatedBatchMode = $false

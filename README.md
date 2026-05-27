@@ -182,15 +182,19 @@ To reduce cost — increase `SnapshotIntervalSeconds` or `BatchIntervalMinutes`.
 
 ## Log Files
 
-Log files are written to the `log/` folder (git-ignored) named `netstat-YYYYMMDD-HHmmss.txt`.
+All log files are written to the `log/` folder (git-ignored). Three file types are generated per session:
 
-Each log entry contains:
-- Timestamp, machine IP, and mode (BATCH or IMMEDIATE-NEW-DEVICE)
-- Raw netstat output (named and PID-enriched)
-- Known IPs at time of analysis
-- Full Claude analysis text
+**Session log** — `netstat-YYYYMMDD-HHmmss.txt`
+- All console output including startup banner, host resolution, VPN detection, cache stats
+- Payload sent to Claude and full analysis text for every batch and immediate alert
+- One file per script run
 
-All console status messages including startup banner, host resolution, VPN detection, cache stats, and batch trigger reasons are also written to the log file.
+**Master connections CSV** — `master-connections-YYYYMMDD-HHmmss.csv`
+- Deduplicated rolling log of all **ESTABLISHED** connections only
+- TIME_WAIT, torrent client, and localhost connections excluded entirely
+- Columns: FirstSeen, LastSeen, Count, LocalAddress, RemoteAddress, Process
+- Updated on disk whenever new connections appear
+- Persists for the full session — focused on what matters
 
 ---
 
