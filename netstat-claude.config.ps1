@@ -85,7 +85,6 @@ function Parse-Hashtable {
 
 function Update-PropertiesExample {
     $examplePath = Join-Path $PSScriptRoot "netstat-claude.properties.example"
-    $exampleTxt  = Join-Path $PSScriptRoot "netstat-claude.properties.example.txt"
 
     $header = @"
 # =============================================================================
@@ -255,29 +254,27 @@ END_PROMPT_IMMEDIATE
 # {6} = timestamps
 
 PromptBatch=<<END_PROMPT_BATCH
-Analyze this batch of {3} netstat snapshots collected over the past 2 hours.
-Snapshots were taken every 15 minutes. Perform a comparative trend analysis.
+Analyze this master connection log from a Windows machine.
+This is a deduplicated rolling log of all unique connections observed this session.
+Each row: FirstSeen, LastSeen, Count, State, LocalAddress, RemoteAddress, Process.
+High Count = persistent. Low Count = transient. Large time gap = long-running.
+Torrent peer rows have been excluded - confirmed normal activity.
 
 Known legitimate IPs resolved at startup:
 {1}
 
-Local pre-analysis summary:
-- Persistent IPs (seen in ALL {3} snapshots): {4}
-- Fleeting IPs (seen only once): {5}
-- New local devices detected this batch: {2}
-- Snapshot timestamps: {6}
+New local devices detected this session: {2}
 
 Focus your analysis on:
-1. Persistent external connections appearing in every snapshot - are they all legitimate?
-2. Any IP appearing in multiple snapshots on non-standard ports
-3. New processes that appeared mid-batch - anything unexpected?
-4. Significant changes between first and last snapshot
-5. Any pattern suggesting data exfiltration, C2 communication or lateral movement
-6. Briefly dismiss confirmed benign fleeting connections
-7. Provide overall risk rating (LOW/MODERATE/HIGH/CRITICAL)
-8. Suggest PowerShell investigation commands for anything flagged
+1. Persistent connections (high Count) to unknown or suspicious external IPs
+2. Any process making connections it should not be making
+3. Connections to non-standard ports on external IPs
+4. Long-running connections to unknown hosts
+5. Any pattern suggesting data exfiltration, C2 or lateral movement
+6. Provide overall risk rating (LOW/MODERATE/HIGH/CRITICAL)
+7. Suggest PowerShell investigation commands for anything flagged
 
-Snapshots (oldest to newest, separated by === SNAPSHOT [time] ===):
+Master connection log (CSV):
 {0}
 END_PROMPT_BATCH
 
@@ -286,7 +283,6 @@ END_PROMPT_BATCH
 # =============================================================================
 "@
     Set-Content -Path $examplePath -Value $header -Encoding UTF8
-    Set-Content -Path $exampleTxt  -Value $header -Encoding UTF8
 }
 
 Update-PropertiesExample
@@ -296,7 +292,8 @@ Update-PropertiesExample
 $required = @("ApiKey","Model","ApiVersion","MaxTokens","Uri",
               "SnapshotIntervalSeconds","BatchIntervalMinutes","MaxSnapshotsPerBatch",
               "KeepaliveIntervalMinutes","ElevatedBatchMinutes","ResolveInterval",
-              "LogFolder","KnownLocalIPs","KnownLocalSubnets","KnownHostnames")
+              "LogFolder","KnownLocalIPs","KnownHostnames")
+# Note: KnownLocalSubnets is optional - VPN interfaces are detected dynamically
 
 $missing = $required | Where-Object {
     -not $props.ContainsKey($_) -and
