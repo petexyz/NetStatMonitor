@@ -11,7 +11,7 @@ A PowerShell-based network monitoring tool that collects `netstat` snapshots on 
 - **Prompt caching** — static machine context cached with Anthropic for cost efficiency (1-hour TTL)
 - **Cache keepalive** — automatically refreshes the prompt cache every 55 minutes
 - **Local pre-analysis** — identifies persistent IPs, fleeting IPs, new processes, and torrent residuals before sending to Claude
-- **Torrent noise filtering** — qBittorrent TIME_WAIT and SYN_SENT residuals summarised and stripped from batch payloads to reduce token usage
+- **Torrent noise filtering** — torrent client TIME_WAIT and SYN_SENT residuals summarised and stripped from batch payloads to reduce token usage
 - **New device detection** — immediately alerts and analyses when an unknown device appears on the local network
 - **Dynamic VPN detection** — detects VPN and virtual network interface IPs at startup and on hourly refresh — no hardcoding needed
 - **Elevated batch mode** — shortens batch interval to 30 minutes on HIGH/CRITICAL findings (snapshot interval never changes)
@@ -121,7 +121,7 @@ END_PROMPT_STATIC
 
 ### VPN and Virtual Interfaces
 
-VPN tunnel IPs (PIA, NordVPN, WireGuard etc) are detected **automatically** at startup and on every hourly refresh. You do not need to add VPN IPs or subnets to your properties file — they change on every connection and the script handles this dynamically.
+VPN tunnel IPs are detected **automatically** at startup and on every hourly refresh. You do not need to add VPN IPs or subnets to your properties file — they change on every connection and the script handles this dynamically.
 
 `KnownLocalSubnets` is optional and only needed for truly static non-VPN subnets.
 
@@ -228,7 +228,7 @@ Set-Acl "netstat-claude.properties" $acl
 | `Stream was not readable` | Log file not created yet | Fixed — log file now created immediately at startup |
 | `Cannot bind argument... Path is null` | Log file path null | Fixed — log folder created before first Write-Log call |
 | Cache stats show `wrote=0 read=0` | Beta header issue | Check `anthropic-beta` header in `Build-CachedHeaders` |
-| VPN IP flagged as new device | VPN subnet not detected | Check startup output for VPN detection — re-run as admin |
+| VPN IP flagged as new device | VPN not yet detected | Check startup output for VPN detection — re-run as admin |
 
 ---
 
@@ -238,14 +238,14 @@ These are commonly flagged but are normal — ensure your `PromptStatic` covers 
 
 | Pattern | Explanation |
 |---------|-------------|
-| qBittorrent `TIME_WAIT` to random high ports | Normal torrent peer residuals — never flag |
-| qBittorrent `SYN_SENT` | Normal peer connection attempts — never flag |
+| Torrent client `TIME_WAIT` to random high ports | Normal peer residuals — never flag |
+| Torrent client `SYN_SENT` | Normal peer connection attempts — never flag |
 | Individual BitTorrent peer IPs | Transient, meaningless for security analysis — ignored by pre-analysis |
-| Bitdefender `Cannot obtain ownership` | Protected process — cross-reference with `netstat -aon` + `tasklist` |
+| Antivirus `Cannot obtain ownership` | Protected process — cross-reference with `netstat -aon` + `tasklist` |
 | VPN tunnel IP detected as new device | Re-run script — dynamic detection resolves on startup |
-| `esrv_svc.exe` polling port 49350 | Intel Energy Server — generates xml_file temp files every minute |
-| Plex xml_file temp files in `%TEMP%` | Normal Plex background polling |
-| Multiple connections from `bdservicehost.exe` | Normal Bitdefender cloud scanning behaviour |
+| System service polling a localhost port repeatedly | Normal background service behaviour |
+| Temp folder XML files generated regularly | Normal background application polling |
+| Multiple connections from antivirus service host | Normal antivirus cloud scanning behaviour |
 
 ---
 
