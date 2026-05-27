@@ -14,11 +14,12 @@ if (-not (Test-Path $configPath)) {
 }
 . $configPath
 
-# Create log folder if needed
+# Create log folder and file IMMEDIATELY - must happen before any Write-Log calls
 if (-not (Test-Path $config.LogFolder)) {
     New-Item -ItemType Directory -Path $config.LogFolder -Force | Out-Null
 }
 $logFile = Join-Path $config.LogFolder "netstat-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
+New-Item -ItemType File -Path $logFile -Force | Out-Null
 
 # Get local machine IP
 $localIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
@@ -28,6 +29,57 @@ $localIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
 
 # Initialise known local IPs as a growable list seeded from config
 $script:knownLocalIPs = [System.Collections.ArrayList]$config.KnownLocalIPs
+
+# Dynamically detect VPN and virtual network interface IPs at startup
+# This covers PIA, any other VPN, and virtual adapters - no hardcoding needed
+function Get-VirtualInterfaceIPs {
+    $virtualIPs = @()
+    $vpnAdapterNames = @(
+        "pia", "vpn", "tun", "tap", "wg", "wireguard",
+        "openvpn", "nordvpn", "expressvpn", "proton",
+        "virtualbox", "vmware", "hyper-v", "vethernet"
+    )
+
+    Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object {
+        $ip        = $_.IPAddress
+        $ifAlias   = (Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue).InterfaceDescription
+        $ifName    = (Get-NetAdapter -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue).Name
+
+        # Skip loopback and link-local
+        if ($ip -match "^127\." -or $ip -match "^169\.254\.") { return }
+
+        # Skip the main physical IP we already know
+        if ($ip -eq $localIP) { return }
+
+        # Flag if adapter name suggests VPN/virtual
+        $isVirtual = $false
+        foreach ($name in $vpnAdapterNames) {
+            if ($ifAlias -imatch $name -or $ifName -imatch $name) {
+                $isVirtual = $true
+                break
+            }
+        }
+
+        # Also flag all non-192.168 and non-10. secondary IPs as potentially VPN
+        if (-not $isVirtual -and $ip -notmatch "^192\.168\.") {
+            $isVirtual = $true
+        }
+
+        if ($isVirtual) {
+            $virtualIPs += $ip
+            # Derive subnet pattern from IP (first two octets)
+            $parts = $ip -split "\."
+            $subnetPattern = "$($parts[0])\.$($parts[1])\."
+            if ($script:knownLocalIPs -notcontains $ip) {
+                $script:knownLocalIPs.Add($ip) | Out-Null
+            }
+            if ($config.KnownLocalSubnets -notcontains $subnetPattern) {
+                $config.KnownLocalSubnets += $subnetPattern
+            }
+        }
+    }
+    return $virtualIPs
+}
 
 # Global known IPs table populated at startup and refreshed hourly
 $knownIPs    = @{}
@@ -519,7 +571,7 @@ foreach ($ip in $script:knownLocalIPs) {
         "192\.168\.4\.47"  { "Smart TV (Plex/Cast client)" }
         "192\.168\.1\.1"   { "Router/DNS" }
         "192\.168\.5\.251" { "This machine" }
-        "10\.20\.224\."    { "This machine via PIA VPN" }
+        "10\."             { "This machine via PIA VPN (dynamic)" }
         default            { "Known device" }
     }
     Write-Log "  $ip - $label" "DarkGray"
@@ -532,6 +584,18 @@ foreach ($subnet in $config.KnownLocalSubnets) {
 }
 
 Write-Log "" "White"
+# Detect VPN and virtual interface IPs dynamically
+Write-Log "Detecting VPN/virtual network interfaces..." "Cyan"
+$detectedVirtualIPs = Get-VirtualInterfaceIPs
+if ($detectedVirtualIPs.Count -gt 0) {
+    foreach ($vip in $detectedVirtualIPs) {
+        Write-Log "  Detected virtual/VPN interface: $vip (added to known IPs)" "DarkGray"
+    }
+} else {
+    Write-Log "  No VPN/virtual interfaces detected" "DarkGray"
+}
+Write-Log "" "White"
+
 Write-Log "Resolving known hosts..." "Cyan"
 $knownIPs    = Resolve-KnownHosts
 $lastResolve = Get-Date
@@ -548,11 +612,19 @@ while ($true) {
     $now       = Get-Date
     $timestamp = $now.ToString('HH:mm:ss')
 
-    # Refresh host resolutions hourly
+    # Refresh host resolutions and re-detect VPN interfaces hourly
     if (((Get-Date) - $lastResolve).TotalSeconds -gt $config.ResolveInterval) {
         Write-Log "$timestamp - Refreshing host resolutions..." "Cyan"
         $knownIPs    = Resolve-KnownHosts
         $lastResolve = Get-Date
+
+        # Re-detect VPN interfaces in case VPN reconnected with a new IP
+        $newVIPs = Get-VirtualInterfaceIPs
+        if ($newVIPs.Count -gt 0) {
+            foreach ($vip in $newVIPs) {
+                Write-Log "$timestamp - VPN interface refresh: $vip" "DarkGray"
+            }
+        }
     }
 
     # Cache keepalive every 55 minutes
